@@ -1,0 +1,33 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isPublicSignupRole(role) {
+      return role in ['worker', 'site_engineer'];
+    }
+
+    // Public signup may only create worker or site_engineer profiles.
+    // Existing owner/manager documents keep their role; clients cannot change role.
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSelf(userId)
+        && isPublicSignupRole(request.resource.data.role);
+      allow update: if isSelf(userId)
+        && request.resource.data.role == resource.data.role;
+      allow delete: if false;
+    }
+
+    // Other collections: signed-in access. The users path is excluded so the
+    // catch-all cannot override the signup role restrictions above.
+    match /{collection}/{document=**} {
+      allow read, write: if isSignedIn() && collection != 'users';
+    }
+  }
+}

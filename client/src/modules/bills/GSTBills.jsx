@@ -1,0 +1,990 @@
+import React, { useState, useEffect } from 'react';
+import { collection, query, where, getDocs, addDoc, doc, updateDoc, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { db } from '../../config/firebase';
+import { useAuth } from '../../context/AuthContext';
+import jsPDF from 'jspdf';
+
+const GSTBills = () => {
+  const { currentUser, userRole } = useAuth();
+  const [bills, setBills] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [windowWidth, setWindowWidth] = useState(window.innerWidth);
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [showGenerateForm, setShowGenerateForm] = useState(false);
+  const [selectedTask, setSelectedTask] = useState('');
+  const [billAmount, setBillAmount] = useState('');
+  const [gstRate, setGstRate] = useState(18);
+
+  useEffect(() => {
+    const handleResize = () => setWindowWidth(window.innerWidth);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  const calculateGST = (amount, rate) => {
+    const gstAmount = (amount * rate) / 100;
+    const totalAmount = amount + gstAmount;
+    return {
+      baseAmount: amount,
+      gstRate: rate,
+      gstAmount: gstAmount,
+      totalAmount: totalAmount
+    };
+  };
+
+  const generateBillNumber = () => {
+    const date = new Date();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+    return `BILL-${year}${month}-${random}`;
+  };
+
+  useEffect(() => {
+    if (currentUser && (userRole === 'manager' || userRole === 'owner')) {
+      loadBills();
+      loadCompletedTasks();
+    }
+  }, [currentUser, userRole]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    let q;
+    if (userRole === 'owner' || userRole === 'manager') {
+      q = query(collection(db, 'gstBills'));
+    } else {
+      return;
+    }
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const billsList = [];
+      snapshot.forEach((docSnapshot) => {
+        billsList.push({ id: docSnapshot.id, ...docSnapshot.data() });
+      });
+      setBills(billsList.sort((a, b) => {
+        const dateA = new Date(a.createdAt?.toDate?.() || a.billDate);
+        const dateB = new Date(b.createdAt?.toDate?.() || b.billDate);
+        return dateB - dateA;
+      }));
+    }, (error) => {
+      console.error('Error listening to bills:', error);
+    });
+
+    return () => unsubscribe();
+  }, [currentUser, userRole]);
+
+  useEffect(() => {
+    if (!currentUser || (userRole !== 'manager' && userRole !== 'owner')) return;
+
+    const q = query(
+      collection(db, 'tasks'),
+      where('status', '==', 'completed')
+    );
+
+    const unsubscribe = onSnapshot(q, async (snapshot) => {
+      const approvedTasks = [];
+      snapshot.forEach((docSnapshot) => {
+        const taskData = { id: docSnapshot.id, ...docSnapshot.data() };
+        // Filter: engineer-approved with cost but not yet billed
+        if (taskData.engineerApproved && taskData.approved && taskData.approvedCost && !taskData.billed) {
+          approvedTasks.push(taskData);
+        }
+      });
+
+      if (approvedTasks.length > 0) {
+        for (const task of approvedTasks) {
+          try {
+            // Only auto-generate if engineer has approved with cost
+            if (!task.engineerApproved || !task.approvedCost) {
+              continue; // Skip tasks without engineer approval/cost
+            }
+
+            const existingBillsQuery = query(
+              collection(db, 'gstBills'),
+              where('taskId', '==', task.id)
+            );
+            const existingBills = await getDocs(existingBillsQuery);
+            
+            if (existingBills.empty) {
+              // Auto-generate bill using engineer-approved cost
+              const amount = task.approvedCost;
+              const calculations = calculateGST(amount, gstRate);
+              const billNumber = generateBillNumber();
+
+              const billData = {
+                billNumber,
+                taskId: task.id,
+                taskTitle: task.title,
+                taskDescription: task.description,
+                projectId: task.projectId || '',
+                projectName: task.projectName || 'N/A',
+                assignedTo: task.assignedTo || '',
+                assignedByName: task.assignedByName || 'N/A',
+                baseAmount: calculations.baseAmount,
+                gstRate: calculations.gstRate,
+                gstAmount: calculations.gstAmount,
+                totalAmount: calculations.totalAmount,
+                engineerApprovedCost: task.approvedCost,
+                billDate: new Date().toISOString(),
+                status: 'generated',
+                generatedBy: 'system',
+                autoGenerated: true,
+                createdAt: serverTimestamp(),
+                synced: navigator.onLine
+              };
+
+              await addDoc(collection(db, 'gstBills'), billData);
+
+              await updateDoc(doc(db, 'tasks', task.id), {
+                billed: true,
+                billId: billData.billNumber,
+                billedAt: serverTimestamp()
+              });
+            }
+          } catch (error) {
+            console.error(`Error auto-generating bill for task ${task.id}:`, error);
+          }
+        }
+        
+        loadCompletedTasks();
+      }
+    }, (error) => {
+      console.error('Error listening to tasks for auto-generation:', error);
+    });
+
+    return () => unsubscribe();
+  }, [currentUser, userRole, gstRate]);
+
+  const loadBills = async () => {
+    try {
+      let q;
+      if (userRole === 'owner' || userRole === 'manager') {
+        q = query(collection(db, 'gstBills'));
+      } else {
+        return;
+      }
+
+      const snapshot = await getDocs(q);
+      const billsList = [];
+      snapshot.forEach((docSnapshot) => {
+        billsList.push({ id: docSnapshot.id, ...docSnapshot.data() });
+      });
+      setBills(billsList.sort((a, b) => {
+        const dateA = new Date(a.createdAt?.toDate?.() || a.billDate);
+        const dateB = new Date(b.createdAt?.toDate?.() || b.billDate);
+        return dateB - dateA;
+      }));
+    } catch (error) {
+      console.error('Error loading bills:', error);
+    }
+  };
+
+  const loadCompletedTasks = async () => {
+    try {
+      const q = query(
+        collection(db, 'tasks'),
+        where('status', '==', 'completed')
+      );
+      const snapshot = await getDocs(q);
+      const tasksList = [];
+      snapshot.forEach((docSnapshot) => {
+        const taskData = { id: docSnapshot.id, ...docSnapshot.data() };
+        // Only show engineer-approved tasks with cost that haven't been billed
+        if (taskData.engineerApproved && taskData.approved && taskData.approvedCost && !taskData.billed) {
+          tasksList.push(taskData);
+        }
+      });
+      setTasks(tasksList);
+    } catch (error) {
+      console.error('Error loading completed tasks:', error);
+    }
+  };
+
+  const handleGenerateBill = async (e) => {
+    e.preventDefault();
+    
+    const task = tasks.find(t => t.id === selectedTask);
+    if (!task) {
+      alert('Task not found');
+      return;
+    }
+
+    // Use engineer-approved cost if available, otherwise use manual input
+    const amount = task.approvedCost || (billAmount ? parseFloat(billAmount) : 0);
+    
+    if (!selectedTask || amount <= 0) {
+      alert('Please select a task with a valid cost amount');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const calculations = calculateGST(amount, gstRate);
+      const billNumber = generateBillNumber();
+
+      const billData = {
+        billNumber,
+        taskId: task.id,
+        taskTitle: task.title,
+        taskDescription: task.description,
+        projectId: task.projectId || '',
+        projectName: task.projectName || 'N/A',
+        assignedTo: task.assignedTo || '',
+        assignedByName: task.assignedByName || 'N/A',
+        baseAmount: calculations.baseAmount,
+        gstRate: calculations.gstRate,
+        gstAmount: calculations.gstAmount,
+        totalAmount: calculations.totalAmount,
+        engineerApprovedCost: task.approvedCost || null,
+        billDate: new Date().toISOString(),
+        status: 'generated',
+        generatedBy: currentUser.uid,
+        createdAt: serverTimestamp(),
+        synced: navigator.onLine
+      };
+
+      await addDoc(collection(db, 'gstBills'), billData);
+
+      await updateDoc(doc(db, 'tasks', task.id), {
+        billed: true,
+        billId: billData.billNumber,
+        billedAt: serverTimestamp()
+      });
+
+      setSelectedTask('');
+      setBillAmount('');
+      setShowGenerateForm(false);
+      loadCompletedTasks();
+      alert('GST Bill generated successfully!');
+    } catch (error) {
+      console.error('Error generating bill:', error);
+      alert('Failed to generate bill');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAutoGenerateBills = async () => {
+    if (!window.confirm('This will auto-generate bills for all completed tasks. Continue?')) {
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // Only process engineer-approved tasks with cost
+      const completedTasks = tasks.filter(t => !t.billed && t.engineerApproved && t.approvedCost);
+      let generated = 0;
+      let failed = 0;
+
+      for (const task of completedTasks) {
+        try {
+          // Use engineer-approved cost
+          const amount = task.approvedCost;
+          const calculations = calculateGST(amount, gstRate);
+          const billNumber = generateBillNumber();
+
+          const billData = {
+            billNumber,
+            taskId: task.id,
+            taskTitle: task.title,
+            taskDescription: task.description,
+            projectId: task.projectId || '',
+            projectName: task.projectName || 'N/A',
+            assignedTo: task.assignedTo || '',
+            assignedByName: task.assignedByName || 'N/A',
+                baseAmount: calculations.baseAmount,
+                gstRate: calculations.gstRate,
+                gstAmount: calculations.gstAmount,
+                totalAmount: calculations.totalAmount,
+                engineerApprovedCost: task.approvedCost,
+                billDate: new Date().toISOString(),
+                status: 'generated',
+                generatedBy: currentUser.uid,
+                autoGenerated: true,
+                createdAt: serverTimestamp(),
+                synced: navigator.onLine
+              };
+
+          await addDoc(collection(db, 'gstBills'), billData);
+
+          await updateDoc(doc(db, 'tasks', task.id), {
+            billed: true,
+            billId: billData.billNumber,
+            billedAt: serverTimestamp()
+          });
+
+          generated++;
+        } catch (error) {
+          console.error(`Error generating bill for task ${task.id}:`, error);
+          failed++;
+        }
+      }
+
+      alert(`Bills generated: ${generated}, Failed: ${failed}`);
+      loadCompletedTasks();
+      setShowGenerateForm(false);
+    } catch (error) {
+      console.error('Error in auto-generation:', error);
+      alert('Error during auto-generation');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDownloadBill = (bill) => {
+    // Create PDF document
+    const doc = new jsPDF();
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const margin = 20;
+    let yPosition = margin;
+
+    // Helper function to format number properly (avoid encoding issues)
+    const formatAmount = (amount) => {
+      // Ensure amount is a number
+      const num = typeof amount === 'number' ? amount : parseFloat(amount);
+      if (isNaN(num) || num === null || num === undefined) {
+        return '0.00';
+      }
+      
+      // Convert to fixed decimal places - ensure it's a valid number
+      const numStr = Number(num).toFixed(2);
+      
+      // Split into integer and decimal parts
+      const parts = numStr.split('.');
+      const integerPart = parts[0] || '0';
+      const decimalPart = parts[1] || '00';
+      
+      // Add commas for thousands separator
+      const formattedInteger = integerPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      
+      // Return as a single string - ensure it's a proper string
+      return formattedInteger + '.' + decimalPart;
+    };
+
+    // Helper function to add text with styling
+    const addText = (text, x, y, fontSize = 12, fontStyle = 'normal', align = 'left') => {
+      doc.setFontSize(fontSize);
+      doc.setFont('helvetica', fontStyle);
+      // Ensure text is a proper string - handle all cases
+      let textStr = '';
+      if (text === null || text === undefined) {
+        textStr = '';
+      } else if (typeof text === 'number') {
+        textStr = text.toString();
+      } else if (typeof text === 'string') {
+        textStr = text;
+      } else {
+        textStr = String(text);
+      }
+      // Use text method with proper options
+      doc.text(textStr, x, y, { align: align });
+    };
+
+    // Helper function to add line
+    const addLine = (x1, y1, x2, y2) => {
+      doc.setLineWidth(0.5);
+      doc.line(x1, y1, x2, y2);
+    };
+
+    // Header
+    addText('GST BILL', pageWidth / 2, yPosition, 20, 'bold', 'center');
+    yPosition += 10;
+    addLine(margin, yPosition, pageWidth - margin, yPosition);
+    yPosition += 15;
+
+    // Bill Number and Date
+    addText(`Bill Number: ${bill.billNumber}`, margin, yPosition, 12, 'bold');
+    yPosition += 8;
+    const billDate = bill.billDate?.toDate ? bill.billDate.toDate() : new Date(bill.billDate);
+    const dateStr = billDate.toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
+    addText(`Date: ${dateStr}`, margin, yPosition, 11);
+    yPosition += 12;
+
+    // Task Details Section
+    addText('Task Details:', margin, yPosition, 12, 'bold');
+    yPosition += 8;
+    addText(`Title: ${bill.taskTitle || 'N/A'}`, margin + 5, yPosition, 10);
+    yPosition += 6;
+    addText(`Project: ${bill.projectName || 'N/A'}`, margin + 5, yPosition, 10);
+    yPosition += 6;
+    
+    // Task Description (with word wrap)
+    if (bill.taskDescription) {
+      const descriptionText = `Description: ${bill.taskDescription}`;
+      const descriptionLines = doc.splitTextToSize(descriptionText, pageWidth - margin * 2 - 10);
+      doc.setFontSize(10);
+      doc.setFont('helvetica', 'normal');
+      doc.text(descriptionLines, margin + 5, yPosition);
+      yPosition += descriptionLines.length * 5;
+    }
+    yPosition += 8;
+
+    // Amount Details Section
+    addLine(margin, yPosition, pageWidth - margin, yPosition);
+    yPosition += 8;
+    addText('Amount Details:', margin, yPosition, 12, 'bold');
+    yPosition += 10;
+
+    // Base Amount - using proper number formatting
+    const baseAmount = typeof bill.baseAmount === 'number' ? bill.baseAmount : parseFloat(bill.baseAmount) || 0;
+    const baseAmountStr = formatAmount(baseAmount);
+    addText('Base Amount:', margin, yPosition, 11);
+    // Build amount text as a single string
+    const baseAmountText = 'Rs. ' + baseAmountStr;
+    doc.setFontSize(11);
+    doc.setFont('helvetica', 'normal');
+    doc.text(baseAmountText, pageWidth - margin, yPosition, { align: 'right' });
+    yPosition += 8;
+
+    // GST Amount
+    const gstAmount = typeof bill.gstAmount === 'number' ? bill.gstAmount : parseFloat(bill.gstAmount) || 0;
+    const gstAmountStr = formatAmount(gstAmount);
+    const gstRateNum = typeof bill.gstRate === 'number' ? bill.gstRate : parseFloat(bill.gstRate) || 18;
+    addText('GST (' + gstRateNum.toString() + '%):', margin, yPosition, 11);
+    // Build amount text as a single string
+    const gstAmountText = 'Rs. ' + gstAmountStr;
+    doc.setFontSize(11);
+    doc.setFont('helvetica', 'normal');
+    doc.text(gstAmountText, pageWidth - margin, yPosition, { align: 'right' });
+    yPosition += 8;
+
+    // Total Amount (highlighted)
+    addLine(margin, yPosition, pageWidth - margin, yPosition);
+    yPosition += 8;
+    const totalAmount = typeof bill.totalAmount === 'number' ? bill.totalAmount : parseFloat(bill.totalAmount) || 0;
+    const totalAmountStr = formatAmount(totalAmount);
+    addText('Total Amount:', margin, yPosition, 14, 'bold');
+    // Build amount text as a single string
+    const totalAmountText = 'Rs. ' + totalAmountStr;
+    doc.setFontSize(14);
+    doc.setFont('helvetica', 'bold');
+    doc.text(totalAmountText, pageWidth - margin, yPosition, { align: 'right' });
+    yPosition += 12;
+
+    // Status
+    addLine(margin, yPosition, pageWidth - margin, yPosition);
+    yPosition += 8;
+    addText(`Status: ${bill.status.toUpperCase()}`, margin, yPosition, 10);
+    if (bill.autoGenerated) {
+      yPosition += 6;
+      addText('(Auto-Generated)', margin, yPosition, 9, 'italic');
+    }
+
+    // Footer
+    const footerY = doc.internal.pageSize.getHeight() - 15;
+    addLine(margin, footerY, pageWidth - margin, footerY);
+    addText('This is a computer-generated bill.', pageWidth / 2, footerY + 8, 8, 'normal', 'center');
+
+    // Save PDF
+    doc.save(`Bill-${bill.billNumber}.pdf`);
+  };
+
+  const filteredBills = bills.filter(bill => {
+    if (filterStatus === 'all') return true;
+    return bill.status === filterStatus;
+  });
+
+  const unbilledTasks = tasks.filter(t => !t.billed);
+
+  if (userRole !== 'manager' && userRole !== 'owner') {
+    return (
+      <div style={{ 
+        width: '100%',
+        maxWidth: '100%',
+        padding: '2rem',
+        textAlign: 'center'
+      }}>
+        <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🔒</div>
+        <h2>Access Restricted</h2>
+        <p style={{ color: '#6b7280' }}>Only managers and owners can view GST bills.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ 
+      width: '100%',
+      maxWidth: '100%',
+      padding: windowWidth <= 768 ? '1rem' : '2rem',
+      boxSizing: 'border-box'
+    }}>
+      <div style={{ 
+        display: 'flex',
+        flexDirection: windowWidth <= 768 ? 'column' : 'row',
+        justifyContent: 'space-between',
+        alignItems: windowWidth <= 768 ? 'stretch' : 'center',
+        marginBottom: '2rem',
+        gap: '1rem'
+      }}>
+        <div>
+          <h1 style={{ 
+            margin: '0 0 0.5rem 0', 
+            fontSize: windowWidth <= 480 ? '1.5rem' : '2rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem'
+          }}>
+            GST Bills
+          </h1>
+          <p style={{ margin: 0, color: '#6b7280', fontSize: '0.875rem' }}>
+            {bills.length} {bills.length === 1 ? 'bill' : 'bills'} generated
+            {unbilledTasks.length > 0 && ` • ${unbilledTasks.length} approved tasks pending billing`}
+          </p>
+        </div>
+        {userRole === 'manager' && (
+          <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+            <button 
+              onClick={() => setShowGenerateForm(!showGenerateForm)}
+              style={{
+                padding: '0.75rem 1.5rem',
+                background: showGenerateForm 
+                  ? '#2563eb'
+                  : '#374151',
+                color: 'white',
+                border: 'none',
+                borderRadius: '12px',
+                fontSize: '0.875rem',
+                fontWeight: '600',
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+                boxShadow: '0 4px 12px rgba(102, 126, 234, 0.4)',
+                whiteSpace: 'nowrap'
+              }}
+            >
+              {showGenerateForm ? '✕ Cancel' : '+ Generate Bill'}
+            </button>
+            {unbilledTasks.length > 0 && (
+              <button 
+                onClick={handleAutoGenerateBills}
+                disabled={loading}
+                style={{
+                  padding: '0.75rem 1.5rem',
+                  background: loading
+                    ? '#9ca3af'
+                    : '#2563eb',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '12px',
+                  fontSize: '0.875rem',
+                  fontWeight: '600',
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                  transition: 'all 0.2s',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                ⚡ Auto-Generate All
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {showGenerateForm && userRole === 'manager' && (
+        <div style={{
+          background: 'white',
+          borderRadius: '16px',
+          padding: windowWidth <= 480 ? '1.5rem' : '2rem',
+          boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
+          marginBottom: '2rem',
+          border: '2px solid #667eea'
+        }}>
+          <h2 style={{ 
+            margin: '0 0 1.5rem 0', 
+            fontSize: windowWidth <= 480 ? '1.25rem' : '1.5rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem'
+          }}>
+            Generate GST Bill
+          </h2>
+
+          <form onSubmit={handleGenerateBill}>
+            <div style={{ marginBottom: '1.5rem' }}>
+              <label style={{ 
+                display: 'block',
+                marginBottom: '0.5rem',
+                fontWeight: '600',
+                color: '#374151',
+                fontSize: '0.875rem'
+              }}>
+                Select Engineer-Approved Task *
+              </label>
+              <select
+                value={selectedTask}
+                onChange={(e) => {
+                  setSelectedTask(e.target.value);
+                  const task = tasks.find(t => t.id === e.target.value);
+                  if (task && task.approvedCost) {
+                    setBillAmount(task.approvedCost.toString());
+                  }
+                }}
+                required
+                style={{ 
+                  width: '100%',
+                  padding: '0.75rem',
+                  border: '2px solid #e5e7eb',
+                  borderRadius: '8px',
+                  fontSize: '1rem',
+                  cursor: 'pointer'
+                }}
+              >
+                <option value="">Select an engineer-approved task</option>
+                {unbilledTasks.map((task) => (
+                  <option key={task.id} value={task.id}>
+                    {task.title} - {task.projectName || 'No Project'} {task.approvedCost && `(Cost: ₹${task.approvedCost.toFixed(2)})`}
+                  </option>
+                ))}
+              </select>
+              {unbilledTasks.length === 0 && (
+                <p style={{ fontSize: '0.75rem', color: '#ef4444', marginTop: '0.25rem' }}>
+                  No engineer-approved tasks available. Engineers need to approve completed tasks with cost first.
+                </p>
+              )}
+            </div>
+
+            {/* Show Engineer-Approved Cost */}
+            {selectedTask && (() => {
+              const task = tasks.find(t => t.id === selectedTask);
+              return task?.approvedCost ? (
+                <div style={{
+                  background: '#dbeafe',
+                  border: '2px solid #93c5fd',
+                  padding: '0.75rem',
+                  borderRadius: '8px',
+                  marginBottom: '1rem',
+                  fontSize: '0.875rem',
+                  color: '#1e40af'
+                }}>
+                  <strong>Engineer-Approved Cost:</strong> ₹{task.approvedCost.toFixed(2)}
+                  <p style={{ margin: '0.25rem 0 0 0', fontSize: '0.75rem', opacity: 0.8 }}>
+                    This cost will be used for bill generation. You can modify it below if needed.
+                  </p>
+                </div>
+              ) : null;
+            })()}
+
+            <div style={{ 
+              display: 'grid', 
+              gridTemplateColumns: windowWidth <= 480 ? '1fr' : '2fr 1fr',
+              gap: '1rem',
+              marginBottom: '1.5rem'
+            }}>
+              <div>
+                <label style={{ 
+                  display: 'block',
+                  marginBottom: '0.5rem',
+                  fontWeight: '600',
+                  color: '#374151',
+                  fontSize: '0.875rem'
+                }}>
+                  Base Amount (₹) {selectedTask && tasks.find(t => t.id === selectedTask)?.approvedCost ? '(Engineer Approved)' : '*'}
+                </label>
+                <input
+                  type="number"
+                  value={billAmount}
+                  onChange={(e) => setBillAmount(e.target.value)}
+                  step="0.01"
+                  min="0"
+                  placeholder={selectedTask && tasks.find(t => t.id === selectedTask)?.approvedCost 
+                    ? tasks.find(t => t.id === selectedTask).approvedCost.toString()
+                    : "0.00"}
+                  required={!selectedTask || !tasks.find(t => t.id === selectedTask)?.approvedCost}
+                  style={{ 
+                    width: '100%',
+                    padding: '0.75rem',
+                    border: '2px solid #e5e7eb',
+                    borderRadius: '8px',
+                    fontSize: '1rem'
+                  }}
+                />
+              </div>
+              <div>
+                <label style={{ 
+                  display: 'block',
+                  marginBottom: '0.5rem',
+                  fontWeight: '600',
+                  color: '#374151',
+                  fontSize: '0.875rem'
+                }}>
+                  GST Rate (%)
+                </label>
+                <select
+                  value={gstRate}
+                  onChange={(e) => setGstRate(parseFloat(e.target.value))}
+                  style={{ 
+                    width: '100%',
+                    padding: '0.75rem',
+                    border: '2px solid #e5e7eb',
+                    borderRadius: '8px',
+                    fontSize: '1rem',
+                    cursor: 'pointer'
+                  }}
+                >
+                  <option value="5">5%</option>
+                  <option value="12">12%</option>
+                  <option value="18">18%</option>
+                  <option value="28">28%</option>
+                </select>
+              </div>
+            </div>
+
+            {((billAmount && parseFloat(billAmount) > 0) || (selectedTask && tasks.find(t => t.id === selectedTask)?.approvedCost)) && (
+              <div style={{
+                background: '#f0f9ff',
+                border: '2px solid #bfdbfe',
+                padding: '1rem',
+                borderRadius: '8px',
+                marginBottom: '1.5rem'
+              }}>
+                <h3 style={{ margin: '0 0 0.75rem 0', fontSize: '0.875rem', color: '#1e40af' }}>
+                  Bill Preview:
+                </h3>
+                {(() => {
+                  const task = tasks.find(t => t.id === selectedTask);
+                  const amount = task?.approvedCost || (billAmount ? parseFloat(billAmount) : 0);
+                  return amount > 0 ? (
+                    <div style={{ display: 'grid', gap: '0.5rem', fontSize: '0.875rem' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>Base Amount:</span>
+                        <strong>₹{amount.toFixed(2)}</strong>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>GST ({gstRate}%):</span>
+                        <strong>₹{((amount * gstRate) / 100).toFixed(2)}</strong>
+                      </div>
+                      <div style={{ 
+                        display: 'flex', 
+                        justifyContent: 'space-between',
+                        paddingTop: '0.5rem',
+                        borderTop: '1px solid #bfdbfe',
+                        fontSize: '1rem',
+                        fontWeight: 'bold',
+                        color: '#1e40af'
+                      }}>
+                        <span>Total Amount:</span>
+                        <strong>₹{(amount * (1 + gstRate / 100)).toFixed(2)}</strong>
+                      </div>
+                    </div>
+                  ) : null;
+                })()}
+              </div>
+            )}
+
+            <button 
+              type="submit"
+              disabled={loading || !selectedTask || (!billAmount && !tasks.find(t => t.id === selectedTask)?.approvedCost)}
+              style={{
+                width: '100%',
+                padding: '1rem',
+                background: (loading || !selectedTask || (!billAmount && !tasks.find(t => t.id === selectedTask)?.approvedCost))
+                  ? '#9ca3af' 
+                  : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                color: 'white',
+                border: 'none',
+                borderRadius: '12px',
+                fontSize: '1rem',
+                fontWeight: '600',
+                cursor: (loading || !selectedTask || (!billAmount && !tasks.find(t => t.id === selectedTask)?.approvedCost)) ? 'not-allowed' : 'pointer'
+              }}
+            >
+              {loading ? 'Generating...' : 'Generate GST Bill'}
+            </button>
+          </form>
+        </div>
+      )}
+
+      {bills.length > 0 && (
+        <div style={{ 
+          display: 'flex',
+          gap: '0.5rem',
+          marginBottom: '1.5rem',
+          overflowX: 'auto',
+          paddingBottom: '0.5rem'
+        }}>
+          {['all', 'generated', 'paid', 'pending'].map((status) => (
+            <button
+              key={status}
+              onClick={() => setFilterStatus(status)}
+              style={{
+                padding: '0.5rem 1rem',
+                background: filterStatus === status 
+                  ? '#2563eb'
+                  : 'white',
+                color: filterStatus === status ? 'white' : '#6b7280',
+                border: filterStatus === status ? 'none' : '2px solid #e5e7eb',
+                borderRadius: '20px',
+                fontSize: '0.875rem',
+                fontWeight: '600',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+                textTransform: 'capitalize'
+              }}
+            >
+              {status === 'all' ? 'All Bills' : status}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {filteredBills.length === 0 ? (
+        <div style={{
+          background: 'white',
+          borderRadius: '16px',
+          padding: '3rem 2rem',
+          boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
+          textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>📄</div>
+          <p style={{ color: '#6b7280' }}>No bills generated yet</p>
+          <p style={{ fontSize: '0.875rem', color: '#9ca3af', marginTop: '0.5rem' }}>
+            Generate bills for completed tasks
+          </p>
+        </div>
+      ) : (
+        <div
+          style={{
+            display: 'grid',
+            gap: '1.5rem',
+            gridTemplateColumns:
+              windowWidth <= 480
+                ? '1fr'
+                : windowWidth <= 900
+                ? 'repeat(2, 1fr)'
+                : 'repeat(3, 1fr)',
+            alignItems: 'stretch',
+            width: '100%',
+          }}
+        >
+          {filteredBills.map((bill) => (
+            <div key={bill.id} style={{
+              background: 'white',
+              borderRadius: '16px',
+              padding: windowWidth <= 480 ? '1rem' : '1.5rem',
+              boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+              border: '2px solid #f3f4f6'
+            }}>
+              <div style={{ 
+                display: 'flex', 
+                justifyContent: 'space-between',
+                alignItems: 'flex-start',
+                marginBottom: '1rem',
+                gap: '1rem',
+                flexWrap: 'wrap'
+              }}>
+                <div style={{ flex: 1 }}>
+                  <h3 style={{ 
+                    margin: '0 0 0.5rem 0',
+                    fontSize: windowWidth <= 480 ? '1.125rem' : '1.25rem',
+                    color: '#1f2937'
+                  }}>
+                    {bill.billNumber}
+                  </h3>
+                  <div style={{ 
+                    fontSize: '0.875rem',
+                    color: '#6b7280',
+                    marginBottom: '0.25rem'
+                  }}>
+                    <strong>Task:</strong> {bill.taskTitle}
+                  </div>
+                  <div style={{ 
+                    fontSize: '0.875rem',
+                    color: '#6b7280',
+                    marginBottom: '0.25rem'
+                  }}>
+                    <strong>Project:</strong> {bill.projectName}
+                  </div>
+                  <div style={{ 
+                    fontSize: '0.75rem',
+                    color: '#9ca3af',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.25rem'
+                  }}>
+                    📅 {new Date(bill.billDate).toLocaleDateString('en-IN', {
+                      dateStyle: 'long'
+                    })}
+                    {bill.autoGenerated && (
+                      <span style={{ 
+                        marginLeft: '0.5rem',
+                        padding: '0.125rem 0.5rem',
+                        background: '#dbeafe',
+                        borderRadius: '4px',
+                        fontSize: '0.625rem',
+                        color: '#1e40af'
+                      }}>
+                        AUTO
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <button
+                  onClick={() => handleDownloadBill(bill)}
+                  style={{
+                    padding: '0.5rem 1rem',
+                    background: '#2563eb',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '8px',
+                    fontSize: '0.875rem',
+                    fontWeight: '600',
+                    cursor: 'pointer',
+                    whiteSpace: 'nowrap'
+                  }}
+                >
+                  📥 Download
+                </button>
+              </div>
+
+              <div style={{
+                background: '#f9fafb',
+                padding: '1rem',
+                borderRadius: '8px',
+                marginBottom: '1rem',
+                border: '1px solid #e5e7eb'
+              }}>
+                <div style={{ display: 'grid', gap: '0.5rem', fontSize: '0.875rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Base Amount:</span>
+                    <strong>₹{bill.baseAmount.toFixed(2)}</strong>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>GST ({bill.gstRate}%):</span>
+                    <strong>₹{bill.gstAmount.toFixed(2)}</strong>
+                  </div>
+                  <div style={{ 
+                    display: 'flex', 
+                    justifyContent: 'space-between',
+                    paddingTop: '0.5rem',
+                    borderTop: '2px solid #e5e7eb',
+                    fontSize: '1.125rem',
+                    fontWeight: 'bold',
+                    color: '#059669'
+                  }}>
+                    <span>Total Amount:</span>
+                    <strong>₹{bill.totalAmount.toFixed(2)}</strong>
+                  </div>
+                </div>
+              </div>
+
+              {bill.taskDescription && (
+                <div style={{
+                  background: '#f0f9ff',
+                  padding: '0.75rem',
+                  borderRadius: '8px',
+                  fontSize: '0.875rem',
+                  color: '#1e40af'
+                }}>
+                  <strong>Work Description:</strong> {bill.taskDescription}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default GSTBills;

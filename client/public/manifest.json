@@ -1,0 +1,9 @@
+{
+  "name": "Site Sync",
+  "short_name": "SiteSync",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "description": "Site Sync App",
+  "icons": []
+}
